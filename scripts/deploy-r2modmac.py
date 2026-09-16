@@ -112,6 +112,7 @@ def main():
         profile.setdefault("mods", []).append(entry)
     else:
         existing.update(entry)
+    profile["needs_sync"] = True
 
     backup = f"{PROFILES_PATH}.before-unified-target-portal"
     if not os.path.exists(backup):
