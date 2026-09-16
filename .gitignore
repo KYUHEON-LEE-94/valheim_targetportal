@@ -1,0 +1,5 @@
+.DS_Store
+.buildrefs/
+bin/
+obj/
+dist/
