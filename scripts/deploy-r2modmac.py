@@ -69,6 +69,7 @@ def main():
         "fullName": f"Local-{manifest['name']}-{version}",
         "iconDataUrl": f"data:image/png;base64,{icon}",
         "importedAt": int(time.time() * 1000),
+        "localId": LOCAL_ID,
         "manifestSha256": manifest_sha,
         "platforms": ["linux", "mac", "windows"],
         "readme": readme,
