@@ -89,7 +89,14 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
     private static readonly FieldInfo? PinUpdateRequiredField = AccessTools.Field(typeof(Minimap), "m_pinUpdateRequired");
     private static readonly FieldInfo? PlacementGhostField = AccessTools.Field(typeof(Player), "m_placementGhost");
     private GameObject? favoriteList;
-    private bool rpcRegistered;
+    // ZRoutedRpc is rebuilt for every world session. A plain "registered" flag
+    // survived the return to the main menu, so the second world a client
+    // joined never registered its handlers and never received a portal list.
+    private ZRoutedRpc? registeredWith;
+    private bool rpcRegistered => registeredWith != null && registeredWith == ZRoutedRpc.instance;
+    private bool listReceived;
+    private float nextListRequest;
+    private float sessionStarted;
     private bool showPortalPins;
     private float nextBroadcast;
     private int lastBroadcastHash;
@@ -141,9 +148,11 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
         harmony.Patch(
             AccessTools.Method(typeof(TeleportWorld), nameof(TeleportWorld.GetHoverText)),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(HoverTextPostfix)));
+        // Existing portals are no longer re-moded on load (see PortalAwakePostfix);
+        // only newly placed ones get the default, through Piece.SetCreator.
         harmony.Patch(
-            AccessTools.Method(typeof(TeleportWorld), "Awake"),
-            postfix: new HarmonyMethod(typeof(PortalFeature), nameof(PortalAwakePostfix)));
+            AccessTools.Method(typeof(ZDOMan), "AddPeer"),
+            postfix: new HarmonyMethod(typeof(PortalFeature), nameof(ZdoAddPeerPostfix)));
         harmony.Patch(
             AccessTools.Method(typeof(Piece), nameof(Piece.SetCreator)),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(PieceSetCreatorPostfix)));
@@ -199,7 +208,7 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
 
     private void RegisterRpcs()
     {
-        if (rpcRegistered || ZRoutedRpc.instance == null)
+        if (ZRoutedRpc.instance == null || registeredWith == ZRoutedRpc.instance)
         {
             return;
         }
@@ -207,22 +216,79 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
         ZRoutedRpc.instance.Register<ZPackage>(ListRpc, OnPortalList);
         ZRoutedRpc.instance.Register(RequestRpc, OnPortalRequest);
         ZRoutedRpc.instance.Register<ZDOID, int, string, string>(ChangeModeRpc, OnPortalModeChange);
-        rpcRegistered = true;
+        registeredWith = ZRoutedRpc.instance;
         lastBroadcastHash = 0;
         nextBroadcast = 0f;
         portals.Clear();
+        listReceived = false;
+        nextListRequest = 0f;
+        sessionStarted = Time.time;
+        Plugin.Log.LogInfo("TargetPortal: portal list handlers registered for this session.");
+    }
 
-        // A joining client asks once; the server also pushes on every change.
-        if (ZNet.instance != null && !ZNet.instance.IsServer())
+    /// <summary>
+    /// A client asks the server for the portal list until one arrives. The
+    /// single request that used to be sent from Game.Start could run before the
+    /// connection finished and be lost, and the server only pushes on change,
+    /// so such a client stayed with an empty list for the whole session.
+    /// </summary>
+    private void UpdateClientList()
+    {
+        if (ZNet.instance == null || ZNet.instance.IsServer() || listReceived || Time.time < nextListRequest)
         {
-            // The two-argument overload routes to the server peer.
-            ZRoutedRpc.instance.InvokeRoutedRPC(RequestRpc);
+            return;
+        }
+        if (ZNet.instance.GetServerPeer() == null)
+        {
+            nextListRequest = Time.time + 1f;
+            return;
+        }
+
+        ZRoutedRpc.instance.InvokeRoutedRPC(RequestRpc);
+        var waited = Time.time - sessionStarted;
+        nextListRequest = Time.time + (waited < 20f ? 2f : 10f);
+
+        // A server without this mod never answers. Fall back to the portals
+        // this client already knows about, so the picker is still usable.
+        if (waited > 10f && portals.Count == 0)
+        {
+            UseLocalPortalList();
+        }
+    }
+
+    private void UseLocalPortalList()
+    {
+        if (ZDOMan.instance == null)
+        {
+            return;
+        }
+        var package = BuildPackage(out _);
+        package.SetPos(0);
+        ReadPortalList(package);
+    }
+
+    private static void ZdoAddPeerPostfix()
+    {
+        // Send the list to a newly connected client soon, instead of waiting
+        // for the next change to the portal set.
+        if (current != null && ZNet.instance != null && ZNet.instance.IsServer())
+        {
+            current.lastBroadcastHash = 0;
+            current.nextBroadcast = Mathf.Min(current.nextBroadcast, Time.time + 2f);
         }
     }
 
     public void Update()
     {
         UpdateMapControls();
+        if (Active && ZRoutedRpc.instance != null && !rpcRegistered)
+        {
+            RegisterRpcs();
+        }
+        if (Active && rpcRegistered)
+        {
+            UpdateClientList();
+        }
         if (!Active || !rpcRegistered || ZNet.instance == null || !ZNet.instance.IsServer() ||
             ZDOMan.instance == null || Time.time < nextBroadcast)
         {
@@ -292,6 +358,12 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
     }
 
     private void OnPortalList(long sender, ZPackage package)
+    {
+        listReceived = true;
+        ReadPortalList(package);
+    }
+
+    private void ReadPortalList(ZPackage package)
     {
         portals.Clear();
         var count = package.ReadInt();
@@ -512,21 +584,11 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
         }
     }
 
-    private static void PortalAwakePostfix(TeleportWorld __instance)
-    {
-        if (!Active || current?.allowPrivatePortals.Value != true || Player.m_localPlayer == null)
-        {
-            return;
-        }
-        var zdo = __instance.GetComponent<ZNetView>()?.GetZDO();
-        var piece = __instance.GetComponent<Piece>();
-        if (zdo == null || piece == null || zdo.GetInt(ModeKey, -1) != -1 ||
-            piece.GetCreator() != Player.m_localPlayer.GetPlayerID())
-        {
-            return;
-        }
-        SetMode(zdo, current.defaultPortalMode.Value, LocalOwnerId(), Player.m_localPlayer.GetPlayerName());
-    }
+    // Removed: PortalAwakePostfix gave every existing portal the local
+    // player had built the default mode (Private) whenever it loaded, which
+    // silently hid long-standing portals from everyone else. TargetPortal only
+    // assigns the default when a portal is placed; portals without a mode stay
+    // Public. Newly placed portals are handled by PieceSetCreatorPostfix.
 
     private static void PieceSetCreatorPostfix(Piece __instance)
     {
@@ -636,8 +698,17 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
 
         ClearPersistentPins();
         ClearPickerPins();
+        if (portals.Count == 0 && ZNet.instance != null && !ZNet.instance.IsServer())
+        {
+            // Nothing from the server yet: ask now and use what this client knows.
+            nextListRequest = 0f;
+            UpdateClientList();
+            UseLocalPortalList();
+        }
+
         var sourceId = source.GetComponent<ZNetView>()?.GetZDO()?.m_uid ?? ZDOID.None;
         var added = 0;
+        var hiddenPrivate = 0;
         foreach (var portal in portals)
         {
             if (portal.Id == sourceId)
@@ -651,6 +722,7 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
             if (allowPrivatePortals.Value && portal.Mode == PortalMode.Private &&
                 !string.Equals(portal.OwnerId, LocalOwnerId(), StringComparison.Ordinal))
             {
+                hiddenPrivate++;
                 continue;
             }
 
@@ -665,8 +737,25 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
 
         if (added == 0)
         {
-            player.Message(MessageHud.MessageType.Center,
-                Loc.Text("이동할 수 있는 다른 포털이 없습니다.", "No other portal to travel to."));
+            // Say why, so an empty list is diagnosable in game.
+            string message;
+            if (portals.Count == 0 && !listReceived && ZNet.instance != null && !ZNet.instance.IsServer())
+            {
+                message = Loc.Text("서버에서 포털 목록을 받는 중입니다. 잠시 후 다시 들어가 보세요.",
+                    "Waiting for the portal list from the server. Try again in a moment.");
+            }
+            else if (hiddenPrivate > 0)
+            {
+                message = Loc.Text($"이동할 수 있는 공개 포털이 없습니다. (다른 사람의 비공개 포털 {hiddenPrivate}개 제외)",
+                    $"No public portal to travel to ({hiddenPrivate} private portal(s) of other players hidden).");
+            }
+            else
+            {
+                message = Loc.Text("이동할 수 있는 다른 포털이 없습니다.", "No other portal to travel to.");
+            }
+            Plugin.Log.LogInfo($"TargetPortal picker empty: list={portals.Count}, received={listReceived}, " +
+                               $"server={ZNet.instance?.IsServer()}, hiddenPrivate={hiddenPrivate}, untaggedShown={showUntagged.Value}.");
+            player.Message(MessageHud.MessageType.Center, message);
             ClearPickerPins();
             return;
         }

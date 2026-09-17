@@ -1,6 +1,6 @@
 {
   "name": "UnifiedTargetPortal",
-  "version_number": "1.0.0",
+  "version_number": "1.0.1",
   "website_url": "https://github.com/KYUHEON-LEE-94/valheim_targetportal",
   "description": "Choose any portal destination from Valheim's map, with private portals, favourites and map pins.",
   "dependencies": [
