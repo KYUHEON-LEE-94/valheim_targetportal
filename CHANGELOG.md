@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2
+
+- **Fixed the mod stopping during startup**, the actual cause of "no other portal": it patched `TeleportWorldTrigger.OnTriggerExit`, which Valheim 1.0 does not have. Harmony threw inside `Awake`, so everything after that patch, including the portal-list handlers, never started.
+- Every patch now goes through a null-safe helper: a method missing from a future Valheim build is logged and skipped instead of stopping the mod.
+- Backing out of the portal without choosing still closes the map, now detected by distance from the portal.
+
 ## 1.0.1
 
 - Fixed "no other portal" for players connected to a server. The client asked for the portal list once, from `Game.Start`, which can run before the connection finishes; the server only pushed the list when portals changed, so that client could stay empty all session. Clients now keep asking until the list arrives, and the server sends it to every newly connected player.

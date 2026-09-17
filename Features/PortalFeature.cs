@@ -81,6 +81,8 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
     private readonly Dictionary<Minimap.PinData, PortalEntry> pinToPortal = new Dictionary<Minimap.PinData, PortalEntry>();
     private readonly List<Minimap.PinData> persistentPins = new List<Minimap.PinData>();
     private TeleportWorld? pickerSource;
+    private bool pickerFromTrigger;
+    private const float LeavePortalDistance = 4f;
     private ConfigEntry<bool> openMapOnEnter = null!;
     private ConfigEntry<bool> portalAnimation = null!;
     private ConfigEntry<bool> hidePinsDuringPortal = null!;
@@ -139,51 +141,74 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
 
     private static bool Active => current?.enabled.Value == true;
 
+    /// <summary>
+    /// Patch one method, or log and skip it if this Valheim build does not
+    /// have it. A single missing method must never abort initialisation: that
+    /// is exactly what left every portal list empty in 1.0.0.
+    /// </summary>
+    private static void Patch(Harmony harmony, System.Reflection.MethodBase? original,
+        HarmonyMethod? prefix = null, HarmonyMethod? postfix = null)
+    {
+        if (original == null)
+        {
+            Plugin.Log.LogWarning("TargetPortal: a game method was not found; that part of the feature stays inactive.");
+            return;
+        }
+        try
+        {
+            harmony.Patch(original, prefix: prefix, postfix: postfix);
+        }
+        catch (Exception error)
+        {
+            Plugin.Log.LogError($"TargetPortal: could not patch {original.DeclaringType?.Name}.{original.Name}: {error.Message}");
+        }
+    }
+
     public void Initialize(Harmony harmony)
     {
         current = this;
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(TeleportWorld), nameof(TeleportWorld.Interact)),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(InteractPrefix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(TeleportWorld), nameof(TeleportWorld.GetHoverText)),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(HoverTextPostfix)));
         // Existing portals are no longer re-moded on load (see PortalAwakePostfix);
         // only newly placed ones get the default, through Piece.SetCreator.
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(ZDOMan), "AddPeer"),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(ZdoAddPeerPostfix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(Piece), nameof(Piece.SetCreator)),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(PieceSetCreatorPostfix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(Minimap), "OnMapLeftClick"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(MapLeftClickPrefix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(Minimap), "RemovePinUnderPointer"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(RemovePinUnderPointerPrefix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(Minimap), nameof(Minimap.SetMapMode)),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(SetMapModePostfix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(Game), "Start"),
             postfix: new HarmonyMethod(typeof(PortalFeature), nameof(GameStartPostfix)));
         // TargetPortal's core: entering the portal opens the map instead of
         // teleporting to a tag-matched partner.
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(TeleportWorldTrigger), "OnTriggerEnter"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(TriggerEnterPrefix)));
-        harmony.Patch(
-            AccessTools.Method(typeof(TeleportWorldTrigger), "OnTriggerExit"),
-            postfix: new HarmonyMethod(typeof(PortalFeature), nameof(TriggerExitPostfix)));
-        harmony.Patch(
+        // Valheim 1.0's TeleportWorldTrigger has no OnTriggerExit, so leaving
+        // the portal is detected from distance in Update instead. Patching the
+        // missing method threw inside Awake and stopped the whole mod.
+        Patch(harmony,
             AccessTools.Method(typeof(Player), "PlacePiece"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(PlacePiecePrefix)));
         // Every portal can reach every other, so every portal is "connected".
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(TeleportWorld), "HaveTarget"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(HaveTargetPrefix)));
-        harmony.Patch(
+        Patch(harmony,
             AccessTools.Method(typeof(TeleportWorld), "TargetFound"),
             prefix: new HarmonyMethod(typeof(PortalFeature), nameof(TargetFoundPrefix)));
         // While choosing a destination, double/middle click must not start
@@ -281,6 +306,7 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
     public void Update()
     {
         UpdateMapControls();
+        UpdateLeftPortal();
         if (Active && ZRoutedRpc.instance != null && !rpcRegistered)
         {
             RegisterRpcs();
@@ -482,23 +508,27 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
         return false;
     }
 
-    private static void TriggerExitPostfix(TeleportWorldTrigger __instance, Collider colliderIn)
+    /// <summary>
+    /// TargetPortal closes the picker when the player backs out of the portal
+    /// without choosing. Valheim 1.0 has no trigger-exit callback, so check the
+    /// distance to the portal the picker was opened from.
+    /// </summary>
+    private void UpdateLeftPortal()
     {
-        if (!Active || current?.pickerSource == null || colliderIn.GetComponent<Player>() != Player.m_localPlayer ||
-            TriggerPortalField?.GetValue(__instance) is not TeleportWorld source ||
-            !ReferenceEquals(source, current.pickerSource))
+        if (pickerSource == null || !pickerFromTrigger || Player.m_localPlayer == null)
         {
             return;
         }
-
-        // TargetPortal's CloseMap component does this when the player backs
-        // out without choosing a destination. Leaving the large map open also
-        // makes vanilla reject the Tab inventory input.
+        if (Vector3.Distance(Player.m_localPlayer.transform.position, pickerSource.transform.position) <= LeavePortalDistance)
+        {
+            return;
+        }
         if (Minimap.instance != null)
         {
+            // Leaving the large map open also makes vanilla reject Tab.
             Minimap.instance.m_dragView = false;
         }
-        current.ClosePicker();
+        ClosePicker();
     }
 
     private static bool PlacePiecePrefix(Player __instance)
@@ -761,6 +791,7 @@ internal sealed class PortalFeature : IFeatureModule, IUpdatableFeature
         }
 
         pickerSource = source;
+        pickerFromTrigger = fromTrigger;
         if (InventoryGui.IsVisible())
         {
             InventoryGui.instance.Hide();
